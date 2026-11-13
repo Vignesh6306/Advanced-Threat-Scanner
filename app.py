@@ -5,7 +5,7 @@ import re
 
 # 1. Load the model we saved to your Google Drive
 # Note: We use the permanent path so it always finds it
-model = joblib.load('/content/drive/MyDrive/threat_model.pkl')
+model = joblib.load('threat_model.pkl')
 
 # 2. The feature extractor
 def extract_features(url):
