@@ -25,10 +25,17 @@ def save_scan(url, score, classification):
 def get_history():
     conn = sqlite3.connect('scan_history.db')
     c = conn.cursor()
-    c.execute("SELECT url, safety_score, classification, timestamp FROM history ORDER BY id DESC")
+    c.execute("SELECT id, url, safety_score, classification, timestamp FROM history ORDER BY id DESC")
     rows = c.fetchall()
     conn.close()
     return rows
+
+def delete_record(record_id):
+    conn = sqlite3.connect('scan_history.db')
+    c = conn.cursor()
+    c.execute("DELETE FROM history WHERE id = ?", (record_id,))
+    conn.commit()
+    conn.close()
 
 def clear_history():
     conn = sqlite3.connect('scan_history.db')
