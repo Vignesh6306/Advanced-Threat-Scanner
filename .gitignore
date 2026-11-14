@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local databases (history stays on your machine, not in Git)
+*.db
+*.sqlite3
+
+# Secrets - NEVER commit these
+.streamlit/secrets.toml
+.env
