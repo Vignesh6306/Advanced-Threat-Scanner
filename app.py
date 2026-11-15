@@ -209,10 +209,16 @@ SHORTENERS = {
 FREE_HOSTS = (
     "weebly.com", "blogspot.com", "wixsite.com", "000webhostapp.com", "glitch.me",
     "netlify.app", "pages.dev", "web.app", "firebaseapp.com", "herokuapp.com",
-    "github.io", "vercel.app", "workers.dev", "duckdns.org", "ngrok.io",
+    "github.io", "vercel.app", "workers.dev", "duckdns.org", "ngrok.io", "appspot.com",
 )
 # Free hosts belong to a brand but anyone can publish there, so they are never auto-trusted.
 TRUSTED -= set(FREE_HOSTS)
+# Big-brand platforms where ANYONE can publish a page. A trusted name does not make the content trusted.
+USER_CONTENT_HOSTS = (
+    "sites.google.com", "docs.google.com", "forms.gle", "drive.google.com", "storage.googleapis.com",
+    "firebasestorage.googleapis.com", "onedrive.live.com", "1drv.ms", "sharepoint.com", "notion.site",
+    "typeform.com", "canva.com", "s3.amazonaws.com", "blob.core.windows.net",
+)
 SUSPICIOUS_TLDS = {
     "xyz", "top", "tk", "ml", "ga", "cf", "gq", "click", "zip", "work", "support",
     "country", "rest", "icu", "buzz", "loan", "mov", "cam", "monster", "sbs", "cyou",
@@ -222,6 +228,7 @@ KEYWORDS = [
     "login", "signin", "verify", "secure", "update", "account", "bank", "confirm",
     "password", "wallet", "free", "giveaway", "bonus", "prize", "suspend", "unlock",
     "billing", "invoice", "refund", "claim", "urgent", "otp", "kyc", "reward", "winner",
+    "phishing", "malware",
 ]
 SECOND_LEVEL = {
     "co.uk", "org.uk", "ac.uk", "gov.uk", "com.au", "co.in", "gov.in", "ac.in",
@@ -246,6 +253,7 @@ CHECK_CATALOG = [
     ("Excessive Subdomains", "Many levels like a.b.c.d.example.com", 15),
     ("Hyphens / Digits / Entropy", "Machine-generated looking domain", 24),
     ("Non-standard Port", "Ports other than 80/443", 10),
+    ("User-Content Platform", "Page hosted where anyone can publish (Google Sites, Forms, OneDrive ...)", 12),
     ("Open Redirect Pattern", "Query string forwards visitors to another site", 30),
     ("Blocklist / Threat Feed", "Domain is on your own blocklist or imported feed", 100),
 ]
@@ -381,7 +389,9 @@ def analyze_url(raw, sensitivity="Balanced", allow=None, block=None):
     reg = registered_domain(host)
     sld = reg.split(".")[0]
     tld = host.split(".")[-1]
-    trusted = reg in TRUSTED or host.endswith(TRUSTED_SUFFIXES) or reg in allow or host in allow
+    allowed = reg in allow or host in allow
+    ugc = any(host == h or host.endswith("." + h) for h in USER_CONTENT_HOSTS) and not allowed
+    trusted = (reg in TRUSTED or host.endswith(TRUSTED_SUFFIXES) or allowed) and not ugc
 
     # 1 scheme -----------------------------------------------------------------
     if p.scheme == "https":
@@ -481,6 +491,13 @@ def analyze_url(raw, sensitivity="Balanced", allow=None, block=None):
         add("Free Hosting Service", "warn", "Hosted on a free / throw-away platform", 8)
     else:
         add("Free Hosting Service", "pass", "Not detected")
+
+    # 9b user-content platforms (sites.google.com, forms.gle ...) ---------------
+    if ugc:
+        add("User-Content Platform", "warn",
+            "Anyone can publish pages here; the trusted brand name does not vouch for this page", 12)
+    else:
+        add("User-Content Platform", "pass", "Not detected")
 
     # 10 risky file ------------------------------------------------------------
     if (p.path or "").lower().endswith(RISKY_EXT):
@@ -599,18 +616,24 @@ def url_anatomy(url: str):
 # =============================================================================
 @contextmanager
 def db():
-    """Yield a cursor; commit on success, roll back on error, always close."""
-    if USE_PG:
-        import psycopg2  # only needed when DATABASE_URL is configured
-        conn = psycopg2.connect(DATABASE_URL, connect_timeout=10)
-    else:
+    """Yield a cursor. Uses PostgreSQL if reachable, else falls back to local SQLite (and says so)."""
+    conn, on_pg = None, False
+    if USE_PG and not st.session_state.get("_pg_down"):
+        try:
+            import psycopg2
+            conn = psycopg2.connect(DATABASE_URL, connect_timeout=8)
+            on_pg = True
+        except Exception as exc:
+            st.session_state["_pg_down"] = explain_db_error(exc)
+    if conn is None:
         conn = sqlite3.connect(DB_PATH, timeout=10)
     try:
         cur = conn.cursor()
-        if not (USE_PG and st.session_state.get("_schema_ok")):
+        if not (on_pg and st.session_state.get("_schema_ok")):
             for stmt in _ddl():
                 cur.execute(stmt)
-            st.session_state["_schema_ok"] = True
+            if on_pg:
+                st.session_state["_schema_ok"] = True
         yield cur
         conn.commit()
     except Exception:
@@ -674,6 +697,7 @@ def scan(raw, source="scanner"):
         allow=[d for _, d in get_list("allow")],
         block=[d for _, d in get_list("block")],
     )
+    res["scanned_at"] = now_str()
     if st.session_state.get("autosave", True):
         save_scan(res, source)
     return res
@@ -773,7 +797,9 @@ def render_result(res, key="r"):
         f'<div class="card"><div style="color:#8ea3c4;font-size:.75rem;letter-spacing:1px">SCANNED TARGET</div>'
         f'<div class="mono">{html.escape(res["url"])}</div>'
         f'<div style="color:#8ea3c4;font-size:.8rem;margin-top:6px">Safe to share: '
-        f'<span class="mono">{html.escape(defang(res["url"]))}</span></div></div>',
+        f'<span class="mono">{html.escape(defang(res["url"]))}</span></div>'
+        f'<div style="color:#8ea3c4;font-size:.75rem;margin-top:6px">Engine v{APP_VERSION} · '
+        f'{len(res["findings"])} checks evaluated · {html.escape(res.get("scanned_at", ""))}</div></div>',
         unsafe_allow_html=True,
     )
     left, right = st.columns([1, 1.35], gap="large")
@@ -811,8 +837,7 @@ def render_result(res, key="r"):
 
 
 def sample_chip(label, url):
-    st.button(label, key=f"chip_{label}", use_container_width=True,
-              on_click=lambda u=url: st.session_state.update(url_input=u))
+    st.button(label, key=f"chip_{label}", use_container_width=True, on_click=set_example, args=(url,))
 
 
 def period_filter(df, choice):
@@ -841,24 +866,43 @@ def page_scanner():
     with c[3]:
         sample_chip("🔢 IP login", "http://192.168.1.1/login.php")
 
+    # The scanner reads the text box value DIRECTLY from the form. It is never copied through
+    # session_state, so a stale value can never be scanned by mistake.
     with st.form("scan_form", clear_on_submit=False):
-        st.text_input("TARGET URL:", key="url_input", placeholder="https://example.com/login")
+        typed = st.text_input("TARGET URL:", value=st.session_state.get("prefill", ""),
+                              key=f"url_box_{st.session_state.get('url_nonce', 0)}",
+                              placeholder="https://example.com/login")
         go_scan = st.form_submit_button("INITIATE DEEP SCAN 🚀")
     auto = st.session_state.pop("autoscan", False)  # set by "Scan this link" buttons
     if go_scan or auto:
-        if not st.session_state.get("url_input", "").strip():
+        target = (typed if go_scan else st.session_state.get("prefill", "")).strip()
+        if not target:
             st.warning("Please enter a URL first.")
         else:
+            st.session_state["prefill"] = target
             with st.spinner("Analysing URL structure, domain and reputation patterns..."):
-                st.session_state["last"] = scan(st.session_state["url_input"])
+                st.session_state["last"] = scan(target)
     if "last" in st.session_state:
         st.divider()
         render_result(st.session_state["last"], "single")
     else:
         card("How it works",
-             "<p>Your link is checked against 16 weighted rules: encryption, hidden hosts, "
-             "look-alike brands, risky extensions and more. The scanner never opens the site, "
+             "<p>Your link is checked against weighted rules: encryption, hidden hosts, look-alike brands, "
+             "open redirects, risky extensions and more. The scanner never opens the site, "
              "so it is safe to test dangerous links.</p>")
+    st.write("")
+    with st.expander("🧪 Verify the scanner is working (self-test)",
+                     expanded=st.session_state.get("selftest_rows") is not None):
+        st.caption("Runs known safe and dangerous-looking links through the engine. Every row should say PASS "
+                   "and the verdicts must differ between links.")
+        st.button("Run self-test", key="run_selftest",
+                  on_click=lambda: st.session_state.update(selftest_rows=run_self_test()))
+        rows = st.session_state.get("selftest_rows")
+        if rows:
+            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+            passed = sum(r["Result"] == "PASS" for r in rows)
+            (st.success if passed == len(rows) else st.error)(
+                f"{passed} / {len(rows)} checks passed (engine v{APP_VERSION})")
 
 
 def parse_uploaded(file):
@@ -1255,7 +1299,7 @@ def page_education():
                             f'<div class="mono">{html.escape(defang(link))}</div></div>', unsafe_allow_html=True)
                 st.markdown("**Red flags:**\n" + "\n".join(f"- {f}" for f in flags))
                 st.button("🔍 Scan this link", key=f"ex_{i}",
-                          on_click=lambda u=link: st.session_state.update(url_input=u, autoscan=True, nav="🔍 Scanner"))
+                          on_click=open_in_scanner, args=(link,))
     with tabs[2]:
         flags = [
             ("🎭", "Hidden host", "paypal.com@evil.xyz really opens evil.xyz."),
@@ -1348,9 +1392,15 @@ def page_education():
 def page_settings():
     hero("Settings & Lists", "Tune detection strictness and manage your own trusted / blocked domains.", "CONFIGURATION")
     st.markdown("### 🎚️ Detection sensitivity")
-    st.radio("Sensitivity", list(SENSITIVITY), horizontal=True, key="sensitivity",
-             help="Lenient x0.75, Balanced x1.0, Strict x1.3 on every penalty.")
-    st.toggle("Save every scan to history", key="autosave")
+    # The real settings live in plain session keys ('sensitivity', 'autosave') which Streamlit never
+    # deletes. The widgets only copy their value into them through a callback.
+    opts = list(SENSITIVITY)
+    current = st.session_state.get("sensitivity", "Balanced")
+    st.radio("Sensitivity", opts, index=opts.index(current) if current in opts else 1, horizontal=True,
+             key="w_sensitivity", help="Lenient x0.75, Balanced x1.0, Strict x1.3 on every penalty.",
+             on_change=lambda: st.session_state.update(sensitivity=st.session_state["w_sensitivity"]))
+    st.toggle("Save every scan to history", value=st.session_state.get("autosave", True), key="w_autosave",
+              on_change=lambda: st.session_state.update(autosave=st.session_state["w_autosave"]))
     st.divider()
 
     a, b = st.columns(2, gap="large")
@@ -1383,26 +1433,43 @@ def page_settings():
             if len(rows) > 50:
                 st.caption(f"Showing 50 of {len(rows)} entries.")
     st.divider()
+
     st.markdown("### 🗄️ Storage")
     try:
-        total, _ = scan_totals()
+        total, _, _ = sidebar_summary()
     except Exception as exc:
         total = None
-        st.error(f"Database not reachable ({type(exc).__name__}). Check DATABASE_URL.")
-    st.caption(f"Backend: **{BACKEND}**  ·  saved scans: {total if total is not None else '?'}  ·  v{APP_VERSION}")
-    if USE_PG:
-        st.success("Connected to PostgreSQL. History survives restarts and redeployments.")
+        st.error(f"Database error ({type(exc).__name__}).")
+    st.caption(f"Backend: **{backend_label()}**  ·  saved scans: {total if total is not None else '?'}  ·  v{APP_VERSION}")
+    if pg_active():
+        st.success("Connected to PostgreSQL. History and scan counts survive restarts and redeployments.")
+    elif USE_PG:
+        st.error(f"DATABASE_URL is set but the database is not reachable. {st.session_state.get('_pg_down', '')} "
+                 "Temporary storage is used meanwhile.")
     else:
-        st.info("History is stored in a local SQLite file, which can reset when Streamlit Community Cloud "
-                "restarts the app. For permanent history add a PostgreSQL URL (see below).")
-    with st.expander("How to enable persistent storage (Supabase / PostgreSQL)"):
-        st.markdown("1. Create a free PostgreSQL database (for example on Supabase).\n"
-                    "2. Copy its connection string.\n"
-                    "3. In Streamlit Cloud open **App settings > Secrets** (or `.streamlit/secrets.toml` locally) "
-                    "and add:")
-        st.code('DATABASE_URL = "postgresql://USER:PASSWORD@HOST:5432/postgres?sslmode=require"', language="toml")
-        st.markdown("4. Make sure `psycopg2-binary` is in `requirements.txt` and reboot the app. "
-                    "Tables are created automatically.")
+        st.warning("History is stored in a temporary file. Streamlit Cloud wipes it whenever the app restarts, "
+                   "sleeps or is redeployed (every GitHub push), so scans reset to zero. "
+                   "Follow the steps below to make it permanent.")
+    if USE_PG and st.button("🔌 Test database connection", key="test_db"):
+        st.session_state.pop("_pg_down", None)
+        st.session_state.pop("_schema_ok", None)
+        try:
+            sidebar_summary()
+        except Exception as exc:
+            st.session_state["_pg_down"] = explain_db_error(exc)
+        st.rerun()
+    with st.expander("How to make history permanent (free Supabase PostgreSQL)", expanded=not USE_PG):
+        st.markdown(
+            "1. Create a free project at **supabase.com**. Choose a database password with letters and "
+            "numbers only.\n"
+            "2. Click **Connect** and copy the **Session pooler** connection string (not 'Direct connection'; "
+            "that one needs IPv6 and fails on Streamlit Cloud). Replace `[YOUR-PASSWORD]` with your password.\n"
+            "3. In Streamlit Cloud open your app: **Manage app > Settings > Secrets** and paste:")
+        st.code('DATABASE_URL = "postgresql://postgres.PROJECTREF:PASSWORD@aws-0-REGION.pooler.supabase.com:5432/postgres"',
+                language="toml")
+        st.markdown("4. Save. The app restarts. Return here and press **Test database connection**.\n\n"
+                    "Never put this URL in GitHub. Free Supabase projects pause after a week of no use; "
+                    "your data is kept and the project can be restored from the Supabase dashboard.")
     st.divider()
     card("🛡️ Security design",
          "<ul><li>URLs are analysed as text. The app <b>never opens them</b>, so there is no SSRF, "
@@ -1429,7 +1496,6 @@ DATABASE_URL = _database_url()
 USE_PG = DATABASE_URL.startswith(("postgres://", "postgresql://"))
 
 
-BACKEND = "PostgreSQL (persistent)" if USE_PG else "SQLite (local file)"
 
 
 HISTORY_COLS = ["id", "url", "score", "classification", "findings", "source", "timestamp"]
@@ -1439,11 +1505,11 @@ DOMAIN_RE = re.compile(r"^(?=.{4,253}$)([a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?\.)+(
 
 
 def _sql(sql):
-    return sql.replace("?", "%s") if USE_PG else sql
+    return sql.replace("?", "%s") if pg_active() else sql
 
 
 def _ddl():
-    pk = "SERIAL PRIMARY KEY" if USE_PG else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    pk = "SERIAL PRIMARY KEY" if pg_active() else "INTEGER PRIMARY KEY AUTOINCREMENT"
     return [
         f"CREATE TABLE IF NOT EXISTS scans(id {pk}, url TEXT NOT NULL, score INTEGER NOT NULL, "
         "classification TEXT NOT NULL, findings TEXT, source TEXT DEFAULT 'scanner', timestamp TEXT NOT NULL)",
@@ -1840,8 +1906,7 @@ REAL_EXAMPLES = [
 
 def render_sidebar_stats():
     try:
-        total, avg = scan_totals()
-        counts = scan_counts()
+        total, avg, counts = sidebar_summary()
     except Exception:
         st.caption("Statistics unavailable")
         return
@@ -1849,7 +1914,90 @@ def render_sidebar_stats():
     c1.metric("Scans", total)
     c2.metric("Avg score", f"{avg:.0f}" if avg is not None else "-")
     st.caption("  ".join(f"{RISK_ICONS[k]} {counts.get(k, 0)}" for k in RISK_ORDER))
-    st.caption(f"Sensitivity: **{st.session_state.get('sensitivity', 'Balanced')}**  ·  {BACKEND}")
+    st.caption(f"Sensitivity: **{st.session_state.get('sensitivity', 'Balanced')}**")
+    if pg_active():
+        st.caption("🟢 Permanent storage (PostgreSQL)")
+    elif USE_PG:
+        st.warning("Database unreachable: using temporary storage. See Settings > Storage.")
+    else:
+        st.warning("Temporary storage: history and scan counts reset when the app restarts. "
+                   "See Settings > Storage to make them permanent.")
+
+
+def set_example(url):
+    """Put a link into the text box. A fresh widget key makes the box show it."""
+    st.session_state["prefill"] = url
+    st.session_state["url_nonce"] = st.session_state.get("url_nonce", 0) + 1
+
+
+def open_in_scanner(url):
+    set_example(url)
+    st.session_state["autoscan"] = True
+    st.session_state["nav"] = "🔍 Scanner"
+
+
+SELF_TEST = [
+    ("https://www.google.com", {"LOW RISK"}),
+    ("https://github.com/anthropics/claude-code", {"LOW RISK"}),
+    ("http://bit.ly/free-iphone-giveaway", {"HIGH RISK", "CRITICAL"}),
+    ("http://www.paypal.com@secure-update-account.xyz/verify", {"CRITICAL"}),
+    ("https://paypal-secure-login.example.com", {"HIGH RISK", "CRITICAL"}),
+    ("http://192.168.1.1/login.php", {"HIGH RISK", "CRITICAL"}),
+    ("https://xn--pple-43d.com/signin", {"HIGH RISK", "CRITICAL"}),
+    ("https://sites.google.com/view/account-verify-now", {"MEDIUM RISK", "HIGH RISK", "CRITICAL"}),
+]
+
+
+def run_self_test():
+    rows = []
+    for url, expected in SELF_TEST:
+        res = analyze_url(url)
+        rows.append({"URL": defang(url), "Expected": " / ".join(sorted(expected, key=RISK_ORDER.index)),
+                     "Got": res["label"], "Score": res["score"],
+                     "Result": "PASS" if res["label"] in expected else "FAIL"})
+    return rows
+
+
+def pg_active():
+    return USE_PG and not st.session_state.get("_pg_down")
+
+
+def backend_label():
+    if pg_active():
+        return "PostgreSQL (persistent)"
+    return "SQLite (temporary - database unreachable)" if USE_PG else "SQLite (temporary file)"
+
+
+def explain_db_error(exc):
+    """Human hint for a failed connection WITHOUT leaking host names or passwords."""
+    msg = str(exc).lower()
+    if isinstance(exc, ImportError):
+        return "psycopg2-binary is missing from requirements.txt."
+    if "password authentication" in msg or "authentication failed" in msg:
+        return "Wrong user name or password (special characters in the password must be URL-encoded)."
+    if "network is unreachable" in msg or "cannot assign requested address" in msg:
+        return ("The app cannot reach that host (usually IPv6). In Supabase use the 'Session pooler' "
+                "connection string, not the 'Direct connection'.")
+    if "could not translate host name" in msg or "name or service not known" in msg:
+        return "Host name not found. Copy the connection string again."
+    if "timeout" in msg or "timed out" in msg:
+        return "Connection timed out. Check host and port, and that the project is not paused."
+    if "does not exist" in msg:
+        return "The database or user does not exist."
+    if "ssl" in msg:
+        return "SSL problem. Add ?sslmode=require to the URL."
+    return f"Connection failed ({type(exc).__name__})."
+
+
+def sidebar_summary():
+    """Total, average score and per-level counts using ONE connection."""
+    with db() as cur:
+        cur.execute("SELECT classification, COUNT(*), AVG(score) FROM scans GROUP BY classification")
+        rows = cur.fetchall()
+    counts = {k: int(n) for k, n, _ in rows}
+    total = sum(counts.values())
+    avg = (sum(float(a) * int(n) for _, n, a in rows) / total) if total else None
+    return total, avg, counts
 
 
 # =============================================================================
@@ -1866,11 +2014,7 @@ PAGES = {
     "⚙️ Settings": page_settings,
 }
 
-# Streamlit drops the value of a widget key when that widget is not drawn on the current page.
-# Re-assigning the value on every run keeps settings and inputs alive while you move between pages.
-for _key in ("sensitivity", "autosave", "url_input", "batch_txt"):
-    if _key in st.session_state:
-        st.session_state[_key] = st.session_state[_key]
+# Settings live in plain session keys (never tied to a widget), so they survive page changes.
 st.session_state.setdefault("sensitivity", "Balanced")
 st.session_state.setdefault("autosave", True)
 st.session_state.setdefault("nav", list(PAGES)[0])
