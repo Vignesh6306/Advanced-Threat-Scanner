@@ -218,6 +218,7 @@ USER_CONTENT_HOSTS = (
     "sites.google.com", "docs.google.com", "forms.gle", "drive.google.com", "storage.googleapis.com",
     "firebasestorage.googleapis.com", "onedrive.live.com", "1drv.ms", "sharepoint.com", "notion.site",
     "typeform.com", "canva.com", "s3.amazonaws.com", "blob.core.windows.net",
+    "lovable.app", "lovableproject.com", "manus.space", "replit.app", "repl.co",  # AI / app-builder hosting
 )
 SUSPICIOUS_TLDS = {
     "xyz", "top", "tk", "ml", "ga", "cf", "gq", "click", "zip", "work", "support",
@@ -255,12 +256,80 @@ CHECK_CATALOG = [
     ("Non-standard Port", "Ports other than 80/443", 10),
     ("User-Content Platform", "Page hosted where anyone can publish (Google Sites, Forms, OneDrive ...)", 12),
     ("Open Redirect Pattern", "Query string forwards visitors to another site", 30),
+    ("Dark-web (.onion) Address", "Tor hidden-service address", 45),
+    ("Source Reputation", "Who runs the site: dark-web directory, piracy, community / opinion content, "
+     "or an established source (caps the score)", 85),
     ("Blocklist / Threat Feed", "Domain is on your own blocklist or imported feed", 100),
 ]
 
 # =============================================================================
 # 3. DETECTION ENGINE
 # =============================================================================
+# --- Source reputation -------------------------------------------------------------------------
+# Link checks only see the SHAPE of a URL. Reputation is a separate axis: who runs the site.
+# A rating CAPS the final score, so a clean-looking address can still come out as Medium/High/Critical.
+LEVEL_CAP = {"LOW RISK": 100, "MEDIUM RISK": 70, "HIGH RISK": 45, "CRITICAL": 15}
+LEVEL_WORDS = {
+    "LOW RISK": ("low", "safe", "trusted", "good"),
+    "MEDIUM RISK": ("medium", "moderate", "caution", "verify"),
+    "HIGH RISK": ("high", "danger", "unsafe"),
+    "CRITICAL": ("critical", "highest", "severe", "extreme"),
+}
+# Starter ratings: (domain, level, category, note). Rated by CATEGORY (what the site is), never by politics.
+# Edit or extend them in Settings > Source reputation, or with an optional reputation.csv next to app.py.
+DEFAULT_REPUTATION = [
+    ("reuters.com", "LOW RISK", "Established news agency", ""),
+    ("apnews.com", "LOW RISK", "Established news agency", ""),
+    ("bbc.com", "LOW RISK", "Public broadcaster", ""),
+    ("bbc.co.uk", "LOW RISK", "Public broadcaster", ""),
+    ("nih.gov", "LOW RISK", "Government research agency", ""),
+    ("cdc.gov", "LOW RISK", "Government health agency", ""),
+    ("who.int", "LOW RISK", "Intergovernmental health agency", ""),
+    ("nature.com", "LOW RISK", "Peer-reviewed publisher", ""),
+    ("science.org", "LOW RISK", "Peer-reviewed publisher", ""),
+    ("thelancet.com", "LOW RISK", "Peer-reviewed publisher", ""),
+    ("nejm.org", "LOW RISK", "Peer-reviewed publisher", ""),
+    ("jstor.org", "LOW RISK", "Academic archive", ""),
+    ("wikipedia.org", "LOW RISK", "Reference encyclopedia", "Community-edited; check the citations."),
+    ("medium.com", "MEDIUM RISK", "Open publishing platform", "Anyone can publish; judge each author."),
+    ("stackoverflow.com", "MEDIUM RISK", "Community Q&A", "Answers are user-written; verify before running code."),
+    ("quora.com", "MEDIUM RISK", "Community Q&A", "Answers are user-written."),
+    ("answers.com", "MEDIUM RISK", "Community Q&A", "Answers are user-written."),
+    ("forbes.com", "MEDIUM RISK", "Mixed editorial and contributor content",
+     "Staff reporting sits beside contributor and sponsored posts."),
+    ("aa.com.tr", "MEDIUM RISK", "State-affiliated news agency", "Check who owns the source."),
+    ("theamericanconservative.com", "MEDIUM RISK", "Opinion / advocacy publication",
+     "Openly ideological; read as opinion."),
+    ("alternet.org", "MEDIUM RISK", "Opinion / advocacy publication", "Openly ideological; read as opinion."),
+    ("fmovies.to", "HIGH RISK", "Piracy streaming site", "Illegal streaming; known for malicious ads."),
+    ("thepiratebay.org", "HIGH RISK", "Torrent / piracy index", "Illegal downloads; malware risk."),
+    ("1337x.to", "HIGH RISK", "Torrent / piracy index", "Illegal downloads; malware risk."),
+    ("thehiddenwiki.org", "CRITICAL", "Dark-web link directory", "Do not visit."),
+    ("tor.taxi", "CRITICAL", "Dark-web link directory", "Do not visit."),
+    ("dark.fail", "CRITICAL", "Dark-web link directory", "Do not visit."),
+    ("darkfail.net", "CRITICAL", "Dark-web link directory or look-alike", "Do not visit."),
+]
+
+
+def normalize_level(text):
+    """'low', 'Medium', 'HIGH RISK', 'critical' ... -> one of RISK_ORDER, or None."""
+    t = str(text or "").strip().lower().replace(" risk", "")
+    for level, words in LEVEL_WORDS.items():
+        if t in words:
+            return level
+    return None
+
+
+def reputation_for(host, table):
+    """Longest-suffix match: 'www.reuters.com' -> reuters.com. Returns (domain, (level, category, note))."""
+    labels = (host or "").split(".")
+    for i in range(len(labels) - 1):
+        cand = ".".join(labels[i:])
+        if cand in (table or {}):
+            return cand, table[cand]
+    return None
+
+
 # Look-alike letters (Cyrillic / Greek) mapped to the Latin letter they imitate.
 CONFUSABLES = str.maketrans({
     "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "х": "x", "у": "y", "і": "i", "ј": "j",
@@ -349,7 +418,7 @@ def _invalid(raw, detail):
     }
 
 
-def analyze_url(raw, sensitivity="Balanced", allow=None, block=None):
+def analyze_url(raw, sensitivity="Balanced", allow=None, block=None, reputation=None):
     """Return {url, score, label, host, findings[]} for one URL."""
     allow, block = set(allow or []), set(block or [])
     scale = SENSITIVITY.get(sensitivity, 1.0)
@@ -392,6 +461,9 @@ def analyze_url(raw, sensitivity="Balanced", allow=None, block=None):
     allowed = reg in allow or host in allow
     ugc = any(host == h or host.endswith("." + h) for h in USER_CONTENT_HOSTS) and not allowed
     trusted = (reg in TRUSTED or host.endswith(TRUSTED_SUFFIXES) or allowed) and not ugc
+    rep = reputation_for(host, reputation)
+    if rep and rep[1][0] == "LOW RISK":
+        trusted = True  # an established source: do not penalise ordinary words in its URLs
 
     # 1 scheme -----------------------------------------------------------------
     if p.scheme == "https":
@@ -470,6 +542,9 @@ def analyze_url(raw, sensitivity="Balanced", allow=None, block=None):
         add("Domain Extension (TLD)", "pass", f".{tld}" if not is_ip else "n/a (IP host)")
 
     # 8 punycode ---------------------------------------------------------------
+    if tld == "onion":
+        add("Dark-web (.onion) Address", "fail",
+            "Tor hidden-service address. Do not open outside Tor and treat with extreme caution.", 45)
     decoded = decode_idna(host)
     if decoded != host or raw_unicode or "xn--" in host:
         dreg = registered_domain(decoded)
@@ -578,6 +653,14 @@ def analyze_url(raw, sensitivity="Balanced", allow=None, block=None):
     else:
         add("Blocklist / Threat Feed", "pass", "Not on your blocklist")
 
+    # 18 source reputation: caps the score so a clean-looking address cannot hide a bad site --------
+    if rep:
+        domain, (level, category, note) = rep
+        base = max(0, 100 - sum(f["penalty"] for f in findings))
+        extra = max(0, base - LEVEL_CAP[level])
+        status = {"LOW RISK": "pass", "MEDIUM RISK": "warn"}.get(level, "fail")
+        detail = f"{category} ({domain})" + (f". {note}" if note else "")
+        findings.insert(0, {"check": "Source Reputation", "status": status, "detail": detail, "penalty": extra})
     score = max(0, 100 - sum(f["penalty"] for f in findings))
     return {"url": raw, "score": score, "label": classify(score), "findings": findings, "host": host}
 
@@ -812,6 +895,9 @@ def render_result(res, key="r"):
         )
         st.write("")
         (st.success if label == "LOW RISK" else st.warning if label == "MEDIUM RISK" else st.error)(tip)
+        if not any(f["check"] == "Source Reputation" for f in res["findings"]):
+            st.caption("ℹ️ This domain is not in the reputation list, so the verdict reflects the link's "
+                       "structure only. Rate it under Settings > Source reputation.")
     with right:
         st.markdown("#### 📋 Detailed URL Analysis")
         st.markdown(checks_html(res["findings"]), unsafe_allow_html=True)
@@ -887,9 +973,10 @@ def page_scanner():
         render_result(st.session_state["last"], "single")
     else:
         card("How it works",
-             "<p>Your link is checked against weighted rules: encryption, hidden hosts, look-alike brands, "
-             "open redirects, risky extensions and more. The scanner never opens the site, "
-             "so it is safe to test dangerous links.</p>")
+             "<p>Two things decide the verdict. <b>Link structure</b>: encryption, hidden hosts, look-alike "
+             "brands, open redirects, risky extensions. <b>Source reputation</b>: who runs the site "
+             "(dark-web directory, piracy site, community or opinion content, established source). "
+             "The scanner never opens the site, so it is safe to test dangerous links.</p>")
     st.write("")
     with st.expander("🧪 Verify the scanner is working (self-test)",
                      expanded=st.session_state.get("selftest_rows") is not None):
@@ -941,14 +1028,18 @@ def page_batch():
         if len(urls) > MAX_BATCH:
             st.info(f"Only the first {MAX_BATCH} unique URLs are scanned (limit protects the server).")
             urls = urls[:MAX_BATCH]
-        bar, rows = st.progress(0.0, text="Scanning..."), []
+        bar, rows, results = st.progress(0.0, text="Scanning..."), [], []
+        rules = load_rules()  # once for the whole batch
         for i, u in enumerate(urls, 1):
-            r = scan(u, "batch")
+            r = analyze_with_rules(u, rules)
+            results.append(r)
             flags = [f["check"] for f in r["findings"] if f["status"] != "pass"]
             rows.append({"URL": r["url"], "Score": r["score"], "Classification": r["label"],
                          "Flags": ", ".join(flags) or "-"})
             bar.progress(i / len(urls), text=f"Scanned {i} of {len(urls)}")
         bar.empty()
+        if st.session_state.get("autosave", True):
+            save_scans(results, "batch")
         st.session_state["batch_df"] = pd.DataFrame(rows)
         st.session_state["batch_dupes"] = dupes
     elif run_paste or run_file:
@@ -1434,6 +1525,9 @@ def page_settings():
                 st.caption(f"Showing 50 of {len(rows)} entries.")
     st.divider()
 
+    settings_reputation()
+    st.divider()
+
     st.markdown("### 🗄️ Storage")
     try:
         total, _, _ = sidebar_summary()
@@ -1517,6 +1611,8 @@ def _ddl():
         "UNIQUE(kind, domain))",
         f"CREATE TABLE IF NOT EXISTS quiz_results(id {pk}, taken_at TEXT NOT NULL, "
         "score INTEGER NOT NULL, total INTEGER NOT NULL, detail TEXT)",
+        f"CREATE TABLE IF NOT EXISTS reputation(id {pk}, domain TEXT NOT NULL UNIQUE, "
+        "risk_level TEXT NOT NULL, category TEXT, note TEXT)",
     ]
 
 
