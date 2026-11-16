@@ -773,14 +773,8 @@ def remove_list(row_id):
 
 
 def scan(raw, source="scanner"):
-    """Analyse with the user's current settings + lists, and optionally save."""
-    res = analyze_url(
-        raw,
-        sensitivity=st.session_state.get("sensitivity", "Balanced"),
-        allow=[d for _, d in get_list("allow")],
-        block=[d for _, d in get_list("block")],
-    )
-    res["scanned_at"] = now_str()
+    """Analyse one link with the current settings, lists and reputation, and optionally save it."""
+    res = analyze_with_rules(raw, load_rules())
     if st.session_state.get("autosave", True):
         save_scan(res, source)
     return res
@@ -2094,6 +2088,144 @@ def sidebar_summary():
     total = sum(counts.values())
     avg = (sum(float(a) * int(n) for _, n, a in rows) / total) if total else None
     return total, avg, counts
+
+
+REPUTATION_FILE = os.path.join(os.path.dirname(os.path.abspath(globals().get("__file__", "app.py"))),
+                               "reputation.csv")
+
+
+def parse_reputation_csv(df):
+    """Rows of (domain, level, category, note) from a DataFrame with domain + level [+ category, note]."""
+    cols = {str(c).strip().lower(): c for c in df.columns}
+    dcol = cols.get("domain") or cols.get("url")
+    lcol = cols.get("level") or cols.get("risk") or cols.get("rating")
+    if dcol is None or lcol is None:
+        raise ValueError("the CSV needs 'domain' and 'level' columns")
+    ccol, ncol = cols.get("category"), cols.get("note") or cols.get("notes")
+    rows, skipped = [], 0
+    for _, r in df.iterrows():
+        dom, lvl = clean_domain(str(r[dcol])), normalize_level(r[lcol])
+        if not valid_domain(dom) or lvl is None:
+            skipped += 1
+            continue
+        cat = str(r[ccol]).strip() if ccol is not None and pd.notna(r[ccol]) else "Custom rating"
+        note = str(r[ncol]).strip() if ncol is not None and pd.notna(r[ncol]) else ""
+        rows.append((dom, lvl, cat[:80], note[:200]))
+    return rows[:5000], skipped
+
+
+def base_reputation():
+    """Built-in ratings, optionally extended by a reputation.csv placed next to app.py."""
+    table = {d: (lvl, cat, note) for d, lvl, cat, note in DEFAULT_REPUTATION}
+    if os.path.exists(REPUTATION_FILE):
+        try:
+            rows, _ = parse_reputation_csv(pd.read_csv(REPUTATION_FILE))
+            table.update({d: (lvl, cat, note) for d, lvl, cat, note in rows})
+        except Exception:
+            pass  # a broken optional file must never break scanning
+    return table
+
+
+def save_reputation(rows):
+    """Insert or update ratings. rows = [(domain, level, category, note)]."""
+    if not rows:
+        return 0
+    with db() as cur:
+        cur.executemany(
+            _sql("INSERT INTO reputation(domain,risk_level,category,note) VALUES(?,?,?,?) "
+                 "ON CONFLICT (domain) DO UPDATE SET risk_level=EXCLUDED.risk_level, "
+                 "category=EXCLUDED.category, note=EXCLUDED.note"), rows)
+    return len(rows)
+
+
+def get_my_reputation():
+    with db() as cur:
+        cur.execute("SELECT id, domain, risk_level, category, note FROM reputation ORDER BY domain")
+        return list(cur.fetchall())
+
+
+def remove_reputation(row_id):
+    with db() as cur:
+        cur.execute(_sql("DELETE FROM reputation WHERE id=?"), (int(row_id),))
+
+
+def load_rules():
+    """Allowlist, blocklist and reputation table in ONE database connection."""
+    with db() as cur:
+        cur.execute("SELECT kind, domain FROM lists")
+        lists = cur.fetchall()
+        cur.execute("SELECT domain, risk_level, category, note FROM reputation")
+        mine = cur.fetchall()
+    table = base_reputation()
+    for d, lvl, cat, note in mine:
+        if lvl in LEVEL_CAP:
+            table[d] = (lvl, cat or "Custom rating", note or "")
+    return [d for k, d in lists if k == "allow"], [d for k, d in lists if k == "block"], table
+
+
+def analyze_with_rules(raw, rules):
+    allow, block, table = rules
+    res = analyze_url(raw, sensitivity=st.session_state.get("sensitivity", "Balanced"),
+                      allow=allow, block=block, reputation=table)
+    res["scanned_at"] = now_str()
+    return res
+
+
+def save_scans(results, source="scanner"):
+    """Save many results through one connection."""
+    if not results:
+        return
+    stamp = now_str()
+    with db() as cur:
+        cur.executemany(
+            _sql("INSERT INTO scans(url,score,classification,findings,source,timestamp) VALUES(?,?,?,?,?,?)"),
+            [(r["url"], r["score"], r["label"], json.dumps(r["findings"]), source, stamp) for r in results])
+
+
+def settings_reputation():
+    st.markdown("### 🏷️ Source reputation")
+    st.caption("Link checks look at the *shape* of a link. Reputation looks at *who runs the site*. A clean "
+               "address can still belong to a piracy site, a dark-web directory or content you should verify, "
+               "so those are rated here and cap the score. Ratings are by category, not by politics. "
+               "Change them to match your own policy.")
+    base, mine = base_reputation(), get_my_reputation()
+    merged = {d: (*v, "built-in") for d, v in base.items()}
+    for _, d, lvl, cat, note in mine:
+        merged[d] = (lvl, cat or "Custom rating", note or "", "yours")
+    df = pd.DataFrame([(d, *v) for d, v in merged.items()], columns=["Domain", "Rating", "Category", "Note", "Source"])
+    df["_o"] = df.Rating.map(RISK_ORDER.index)
+    df = df.sort_values(["_o", "Domain"]).drop(columns="_o")
+    st.dataframe(df, hide_index=True, use_container_width=True, height=260)
+    st.caption(f"{len(df)} rated domains ({len(mine)} added or changed by you). "
+               "Unrated domains are judged by link structure only.")
+    with st.form("form_rep", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+        dom = c1.text_input("Domain", placeholder="example.com")
+        lvl = c2.selectbox("Rating", RISK_ORDER)
+        cat = c1.text_input("Category", placeholder="e.g. Opinion publication")
+        note = c2.text_input("Note (optional)")
+        if st.form_submit_button("Save rating"):
+            d = clean_domain(dom)
+            if valid_domain(d):
+                save_reputation([(d, lvl, cat.strip()[:80] or "Custom rating", note.strip()[:200])])
+                st.toast(f"Saved {d} as {lvl}", icon="🏷️")
+            else:
+                st.warning("Enter a valid domain such as example.com")
+    up = st.file_uploader("Import ratings (.csv with columns: domain, level, category, note)", type=["csv"],
+                          key="imp_rep")
+    if st.button("Import ratings", key="impbtn_rep", disabled=up is None):
+        try:
+            rows, skipped = parse_reputation_csv(pd.read_csv(io.BytesIO(up.getvalue())))
+            st.toast(f"Imported {save_reputation(rows)} rating(s), skipped {skipped}", icon="🏷️")
+        except Exception as exc:
+            st.error(f"Could not read the file: {exc}")
+    for rid, d, lvl, cat, note in mine[:50]:
+        r1, r2, r3 = st.columns([3, 2, 1])
+        r1.markdown(f'<span class="mono">{html.escape(d)}</span>', unsafe_allow_html=True)
+        r2.markdown(badge(lvl), unsafe_allow_html=True)
+        r3.button("✖", key=f"rmrep_{rid}", on_click=remove_reputation, args=(rid,))
+    st.download_button("Export all ratings (CSV)", csv_safe(df).to_csv(index=False).encode(),
+                       "reputation.csv", "text/csv", key="exp_rep")
 
 
 # =============================================================================
